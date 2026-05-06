@@ -1,0 +1,36 @@
+# Dataset config for generating a video from a single image + RealEstate10K trajectory.
+# All values are matched to the DFoT_RE10K.ckpt pretrained model.
+#
+# Required overrides (pass on CLI or via generate_video.py):
+#   dataset.image_path=/path/to/image.jpg
+#   dataset.trajectory_path=/path/to/trajectory.txt
+
+defaults:
+  - base_video
+
+# ── User-provided inputs ───────────────────────────────────────────────────────
+image_path: ???         # (required) path to the starting image
+trajectory_path: ???    # (required) path to a RealEstate10K-format .txt trajectory
+
+# ── Must match the pretrained DFoT_RE10K checkpoint ───────────────────────────
+resolution: 256
+max_frames: 8           # context-window size the model was trained with
+external_cond_dim: 16   # 4 intrinsics + 12 extrinsics per frame
+external_cond_stack: false
+external_cond_processing: null
+
+# ── RE10K normalisation constants (from the training set) ─────────────────────
+data_mean: [[[0.577]], [[0.517]], [[0.461]]]
+data_std:  [[[0.249]], [[0.249]], [[0.268]]]
+
+# ── Inference settings (can be overridden on the CLI) ─────────────────────────
+n_frames: 50            # total frames to generate
+context_length: 1       # use only the first frame as context
+frame_skip: 1           # no temporal skip for custom trajectories
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+save_dir: /tmp/single_image_trajectory  # unused (no data download)
+filter_min_len: null
+subdataset_size: null
+num_eval_videos: 1
+num_samples: 1          # how many independent videos to generate per run

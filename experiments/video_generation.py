@@ -4,6 +4,7 @@ from datasets.video import (
     RealEstate10KAdvancedVideoDataset,
     RealEstate10KMiniAdvancedVideoDataset,
     RealEstate10KOODAdvancedVideoDataset,
+    SingleImageTrajectoryDataset,
 )
 from algorithms.dfot import DFoTVideo, DFoTVideoPose
 from .base_exp import BaseLightningExperiment
@@ -29,6 +30,8 @@ class VideoGenerationExperiment(BaseLightningExperiment):
         realestate10k_ood=RealEstate10KOODAdvancedVideoDataset,
         realestate10k_mini=RealEstate10KMiniAdvancedVideoDataset,
         kinetics_600=Kinetics600AdvancedVideoDataset,
+        # single image + custom trajectory
+        single_image_trajectory=SingleImageTrajectoryDataset,
     )
 
     data_module_cls = _data_module_cls
