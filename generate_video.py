@@ -188,18 +188,22 @@ def build_algo_config(n_frames: int, guidance_type: str, guidance_scale: float):
                 "+name=generate_video",
                 "wandb.entity=dummy",              # required field; unused at inference
                 "wandb.mode=disabled",
-                "dataset=single_image_trajectory",
+                # Use realestate10k so that realestate10k_video_generation.yaml is
+                # picked up automatically by the optional dataset_experiment override.
+                # That file sets the backbone architecture, diffusion schedule, etc.
+                # that must match the pretrained checkpoint.
+                # (We only use cfg.algorithm from this compose; no dataset is loaded.)
+                "dataset=realestate10k",
                 "algorithm=dfot_video_pose",
                 "experiment=video_generation",
                 # Expand the @diffusion/continuous shortcut inline
                 "++algorithm.diffusion.is_continuous=true",
                 "++algorithm.backbone.use_fourier_noise_embedding=true",
                 "++algorithm.diffusion.precond_scale=0.125",
-                # Dummy paths so Hydra can resolve the config (not actually read here)
-                "dataset.image_path=/dev/null",
-                "dataset.trajectory_path=/dev/null",
-                # Number of frames drives many interpolations in the algo config
+                # Override the dataset fields that the algo config interpolates
                 f"dataset.n_frames={n_frames}",
+                "dataset.context_length=1",
+                "dataset.frame_skip=1",
                 # Inference guidance settings
                 f"++algorithm.tasks.prediction.history_guidance.name={guidance_type}",
                 f"++algorithm.tasks.prediction.history_guidance.guidance_scale={guidance_scale}",
