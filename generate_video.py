@@ -200,6 +200,19 @@ def build_algo_config(n_frames: int, guidance_type: str, guidance_scale: float):
                 "++algorithm.diffusion.is_continuous=true",
                 "++algorithm.backbone.use_fourier_noise_embedding=true",
                 "++algorithm.diffusion.precond_scale=0.125",
+                # Keys from realestate10k_video_generation.yaml — set explicitly so
+                # the script works even if the optional dataset_experiment file is skipped.
+                "++algorithm.diffusion.training_schedule.name=cosine",
+                "++algorithm.diffusion.training_schedule.shift=0.125",
+                "++algorithm.diffusion.beta_schedule=cosine_simple_diffusion",
+                "++algorithm.diffusion.schedule_fn_kwargs.shifted=0.125",
+                "++algorithm.diffusion.schedule_fn_kwargs.interpolated=false",
+                "++algorithm.diffusion.loss_weighting.strategy=sigmoid",
+                "++algorithm.diffusion.loss_weighting.sigmoid_bias=-1.0",
+                "++algorithm.backbone.channels=[128,256,576,1152]",
+                "++algorithm.backbone.num_updown_blocks=[3,3,6]",
+                "++algorithm.backbone.num_mid_blocks=20",
+                "++algorithm.backbone.num_heads=9",
                 # Override the dataset fields that the algo config interpolates
                 f"dataset.n_frames={n_frames}",
                 "dataset.context_length=1",
