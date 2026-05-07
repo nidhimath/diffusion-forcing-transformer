@@ -43,7 +43,6 @@ import numpy as np
 import torch
 from PIL import Image
 import torchvision.transforms.functional as TF
-from torchvision.io import write_video
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
@@ -301,12 +300,30 @@ def generate(
         xs_latent[:, :n_ctx] = ctx_latents
         xs = xs_latent
 
+    # The sliding-window loop in _predict_sequence slices exactly max_tokens conditions
+    # at each step. When T is not of the form max_tokens + k*(max_tokens-sliding_ctx),
+    # the last slice overflows and the model raises a length mismatch error. Fix: pad
+    # xs and conditions to the next safe length, generate, then trim.
+    max_tokens = model.max_tokens
+    sliding_ctx = model.cfg.tasks.prediction.sliding_context_len or max_tokens // 2
+    stride = max_tokens - sliding_ctx
+    if T > max_tokens and (T - max_tokens) % stride != 0:
+        T_safe = T + stride - (T - max_tokens) % stride
+        n_pad = T_safe - T
+        xs = torch.cat([xs, xs[:, -1:].expand(-1, n_pad, -1, -1, -1)], dim=1)
+        conditions = torch.cat([conditions, conditions[:, -1:].expand(-1, n_pad, -1)], dim=1)
+    else:
+        T_safe = T
+
     # Generate all frames via sliding-window diffusion rollout
     xs_pred = model._predict_videos(xs, conditions=conditions)
 
     # Decode latents → pixels (no-op for pixel-space models)
     if model.is_latent_diffusion:
         xs_pred = model._decode(xs_pred)
+
+    # Trim any padding frames before unnormalizing
+    xs_pred = xs_pred[:, :T]
 
     # Unnormalize to [0, 1]
     xs_pred = model._unnormalize_x(xs_pred)                    # (1, T, 3, H, W)
@@ -320,6 +337,37 @@ def generate(
     # Convert to (T, H, W, 3) uint8
     frames = (xs_pred[0].permute(0, 2, 3, 1) * 255).clamp(0, 255).byte().cpu()
     return frames
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Video writing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_video(path: str, frames: torch.Tensor, fps: int) -> None:
+    """Pipe raw RGB frames into ffmpeg to produce a browser-compatible H.264 mp4.
+    Falls back to cv2 if ffmpeg is unavailable."""
+    import subprocess
+    H, W = frames.shape[1], frames.shape[2]
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{W}x{H}", "-pix_fmt", "rgb24", "-r", str(fps),
+        "-i", "pipe:0",
+        "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+        path,
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        for frame in frames.numpy():
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+        proc.wait()
+    except Exception:
+        import cv2
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+        for frame in frames.numpy():
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.release()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,7 +404,7 @@ def main():
     frames = generate(model, image, poses, args.device)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    write_video(str(args.output), frames, fps=args.fps)
+    _write_video(str(args.output), frames, fps=args.fps)
     print(f"\nDone — video saved to: {args.output}")
 
 
