@@ -104,49 +104,68 @@ def parse_trajectory(txt_path: Path, n_frames: int) -> torch.Tensor:
       16 values/line – pre-processed (used as-is)
     """
     cameras = []
+    timestamps = []
+
     with open(txt_path, "r") as f:
         lines = f.readlines()
 
     for i, line in enumerate(lines):
         if i == 0:
-            continue          # first line is the YouTube URL
+            continue  # YouTube URL
+
         line = line.strip()
         if not line:
             continue
+
         parts = line.split()
+
+        # timestamp is first value
+        timestamps.append(float(parts[0]))
+
+        # camera params (drop timestamp only)
         cam = np.array([float(x) for x in parts[1:]], dtype=np.float32)
         cameras.append(cam)
 
     if not cameras:
         raise ValueError(f"No camera frames found in {txt_path}")
 
-    cameras = np.stack(cameras)                            # (N, raw_dim)
+    cameras = np.stack(cameras)  # (N, raw_dim)
+    timestamps = np.array(timestamps, dtype=np.float64)
+
     cameras = torch.tensor(cameras, dtype=torch.float32)
+    timestamps = torch.tensor(timestamps, dtype=torch.float32)
+
     N, raw_dim = cameras.shape
 
-    # Subsample or interpolate to exactly n_frames poses
-    if N >= n_frames:
-        idx = torch.linspace(0, N - 1, n_frames).round().long()
-        cameras = cameras[idx]
-    else:
-        t = torch.linspace(0, N - 1, n_frames)
-        lo = t.floor().long().clamp(0, N - 2)
-        hi = (lo + 1).clamp(0, N - 1)
-        alpha = (t - lo.float()).unsqueeze(-1)
-        cameras = cameras[lo] * (1 - alpha) + cameras[hi] * alpha
+    # normalize time to [0, 1]
+    t_norm = (timestamps - timestamps.min()) / (timestamps.max() - timestamps.min() + 1e-8)
 
-    # Convert to 16-dim processed format (matches _process_external_cond)
+    # target uniformly spaced time grid
+    target_t = torch.linspace(0, 1, n_frames)
+
+    # interpolate in time space
+    cameras_out = []
+    for dim in range(raw_dim):
+        cameras_out.append(
+            torch.interp(
+                target_t,
+                t_norm,
+                cameras[:, dim]
+            )
+        )
+
+    cameras = torch.stack(cameras_out, dim=-1)
+
+    # Convert to 16-dim processed format
     if raw_dim == 18:
-        poses = torch.cat([cameras[:, :4], cameras[:, 6:]], dim=-1)   # (T, 16)
+        poses = torch.cat([cameras[:, :4], cameras[:, 6:]], dim=-1)
     elif raw_dim == 16:
         poses = cameras
     else:
         raise ValueError(
-            f"{txt_path}: expected 18 (raw RE10K) or 16 (pre-processed) camera "
-            f"values per line, got {raw_dim}."
+            f"{txt_path}: expected 18 or 16 values per line, got {raw_dim}."
         )
-    return poses   # (n_frames, 16)
-
+    return poses
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Image loading
