@@ -118,21 +118,30 @@ def generate_hierarchical(model, image, poses, args):
     video = model._normalize_x(video)
     cond = poses.unsqueeze(0).to(device)
 
-    # Find tasks by their class name instead of string-indexing.
-    prediction_task = None
-    interpolation_task = None
-    for task in model.tasks:
-        cls = type(task).__name__.lower()
-        if 'prediction' in cls:
-            prediction_task = task
-        elif 'interpolation' in cls:
-            interpolation_task = task
+    # Inspect model internals safely (no Lightning properties)
+    model_attrs = vars(model)  # raw __dict__ only, no property access
+    print("Model keys:", list(model_attrs.keys()))
 
-    if prediction_task is None:
+    # model.tasks is ['prediction'] — a list of strings used as keys.
+    # The actual task objects are likely in a dict like model.task_map,
+    # or as nn.ModuleDict. Find it:
+    task_container = None
+    for k, v in model_attrs.items():
+        if isinstance(v, (dict, torch.nn.ModuleDict)):
+            if any(name in v for name in ('prediction', 'interpolation')):
+                task_container = v
+                print(f"Found task container at model.{k}: {list(v.keys())}")
+                break
+
+    if task_container is None:
+        # Fallback: print all attr types to diagnose
         raise RuntimeError(
-            "Could not find a prediction task in model.tasks. "
-            f"Available task types: {[type(t).__name__ for t in model.tasks]}"
+            "Could not find task container.\n" +
+            "\n".join(f"  {k}: {type(v).__name__}" for k, v in model_attrs.items())
         )
+
+    prediction_task = task_container.get('prediction')
+    interpolation_task = task_container.get('interpolation')
 
     # ── FIX: the task method is likely `sample` or `generate`, not
     # `predict_video`. Inspect what's actually available at runtime.
