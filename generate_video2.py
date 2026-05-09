@@ -89,12 +89,16 @@ def build_algo_config(args):
             "++algorithm.backbone.num_updown_blocks=[3,3,6]",
             "++algorithm.backbone.num_mid_blocks=20",
             "++algorithm.backbone.num_heads=9",
-            f"dataset.n_frames={args.n_frames}", "dataset.context_length=1",
+            "dataset.n_frames=25",          # ← match what the checkpoint was trained on
+            "dataset.context_length=1",
+            # lower guidance scales reduce CFG memory overhead
             f"++algorithm.tasks.prediction.history_guidance.name={args.guidance_type}",
             f"++algorithm.tasks.prediction.history_guidance.guidance_scale={args.guidance_scale}",
             f"++algorithm.tasks.prediction.history_guidance.stabilization_level={args.stabilization_level}",
             f"++algorithm.tasks.interpolation.history_guidance.name={args.interp_guidance_type}",
             f"++algorithm.tasks.interpolation.history_guidance.guidance_scale={args.interp_guidance_scale}",
+            "++algorithm.diffusion.sampling_timesteps=10",   # ← biggest memory/speed lever
+            "++algorithm.tasks.interpolation.max_batch_size=1",  # ← prevents interpolation OOM
         ])
     return cfg.algorithm
 
@@ -110,42 +114,27 @@ def load_model_weights(model, checkpoint_str, device):
 
 @torch.no_grad()
 def generate_hierarchical(model, image, poses, args):
-    """
-    Hierarchical generation using DFoTVideo's native _predict_videos(),
-    which internally handles keyframe prediction + interpolation.
-    """
-    T = poses.shape[0]
+    T = poses.shape[0]   # e.g. 64 — this is fine, sliding window handles it
     device = args.device
 
-    # (1, T, C, H, W) normalized — _predict_videos expects this shape
     xs = image.unsqueeze(0).expand(T, -1, -1, -1).unsqueeze(0).to(device)
     xs = model._normalize_x(xs)
-
-    # (1, T, 12) raw camera pose vectors
     conditions = poses.unsqueeze(0).to(device)
 
-    # Temporarily override keyframe_density from args so the model's
-    # internal keyframe + interpolation logic uses the value you want
+    model.cfg.n_frames = T
     original_density = model.cfg.tasks.prediction.keyframe_density
     model.cfg.tasks.prediction.keyframe_density = args.keyframe_density
+    original_scl = model.cfg.tasks.prediction.sliding_context_len
+    model.cfg.tasks.prediction.sliding_context_len = model.n_context_tokens
 
-    step = int(1 / args.keyframe_density)
-    n_keyframes = len(range(0, T, step))
-    print(f"   -> Phase 1: Generating {n_keyframes} anchor keyframes...")
-    print(f"   -> Phase 2: Interpolating gaps (handled internally)...")
-
-    # This single call does both phases:
-    #   1. predicts keyframes at keyframe_density spacing
-    #   2. calls _interpolate_videos() to fill in the gaps
     xs_pred = model._predict_videos(xs, conditions=conditions)
+    torch.cuda.empty_cache()
 
-    # Restore config
     model.cfg.tasks.prediction.keyframe_density = original_density
+    model.cfg.tasks.prediction.sliding_context_len = original_scl
 
-    # Unnormalize and hard-pin the conditioning frame
     xs_pred = model._unnormalize_x(xs_pred)
     xs_pred[0, 0] = image.to(device)
-
     frames = (xs_pred[0].permute(0, 2, 3, 1) * 255).clamp(0, 255).byte().cpu()
     return frames
 
