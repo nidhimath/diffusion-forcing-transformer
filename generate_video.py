@@ -139,7 +139,7 @@ def parse_trajectory(txt_path: Path, n_frames: int) -> torch.Tensor:
             t_norm_np,
             cameras_np[:, dim]
         )
-        cameras_out.append(torch.from_numpy(interp_dim))
+        cameras_out.append(torch.from_numpy(interp_dim.astype(np.float32)))
 
     cameras = torch.stack(cameras_out, dim=-1)
 
