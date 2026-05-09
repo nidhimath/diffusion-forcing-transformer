@@ -110,83 +110,43 @@ def load_model_weights(model, checkpoint_str, device):
 
 @torch.no_grad()
 def generate_hierarchical(model, image, poses, args):
+    """
+    Hierarchical generation using DFoTVideo's native _predict_videos(),
+    which internally handles keyframe prediction + interpolation.
+    """
     T = poses.shape[0]
     device = args.device
+
+    # (1, T, C, H, W) normalized — _predict_videos expects this shape
+    xs = image.unsqueeze(0).expand(T, -1, -1, -1).unsqueeze(0).to(device)
+    xs = model._normalize_x(xs)
+
+    # (1, T, 12) raw camera pose vectors
+    conditions = poses.unsqueeze(0).to(device)
+
+    # Temporarily override keyframe_density from args so the model's
+    # internal keyframe + interpolation logic uses the value you want
+    original_density = model.cfg.tasks.prediction.keyframe_density
+    model.cfg.tasks.prediction.keyframe_density = args.keyframe_density
+
     step = int(1 / args.keyframe_density)
+    n_keyframes = len(range(0, T, step))
+    print(f"   -> Phase 1: Generating {n_keyframes} anchor keyframes...")
+    print(f"   -> Phase 2: Interpolating gaps (handled internally)...")
 
-    video = image.unsqueeze(0).expand(T, -1, -1, -1).unsqueeze(0).to(device)
-    video = model._normalize_x(video)
-    cond = poses.unsqueeze(0).to(device)
+    # This single call does both phases:
+    #   1. predicts keyframes at keyframe_density spacing
+    #   2. calls _interpolate_videos() to fill in the gaps
+    xs_pred = model._predict_videos(xs, conditions=conditions)
 
-    # Inspect model internals safely (no Lightning properties)
-    model_attrs = vars(model)  # raw __dict__ only, no property access
-    print("Model keys:", list(model_attrs.keys()))
+    # Restore config
+    model.cfg.tasks.prediction.keyframe_density = original_density
 
-    # model.tasks is ['prediction'] — a list of strings used as keys.
-    # The actual task objects are likely in a dict like model.task_map,
-    # or as nn.ModuleDict. Find it:
-    task_container = None
-    for k, v in model_attrs.items():
-        if isinstance(v, (dict, torch.nn.ModuleDict)):
-            if any(name in v for name in ('prediction', 'interpolation')):
-                task_container = v
-                print(f"Found task container at model.{k}: {list(v.keys())}")
-                break
+    # Unnormalize and hard-pin the conditioning frame
+    xs_pred = model._unnormalize_x(xs_pred)
+    xs_pred[0, 0] = image.to(device)
 
-    if task_container is None:
-        # Fallback: print all attr types to diagnose
-        raise RuntimeError(
-            "Could not find task container.\n" +
-            "\n".join(f"  {k}: {type(v).__name__}" for k, v in model_attrs.items())
-        )
-
-    prediction_task = task_container.get('prediction')
-    interpolation_task = task_container.get('interpolation')
-
-    # ── FIX: the task method is likely `sample` or `generate`, not
-    # `predict_video`. Inspect what's actually available at runtime.
-    # The official pipeline calls the task via the experiment runner, which
-    # invokes task.generate() or task.sample() with a data batch dict.
-    # Use getattr with a fallback so you get a clear error if wrong.
-    def call_task(task, xs, conditions):
-        """Try the known method names in order."""
-        for method_name in ('generate', 'sample', 'predict_video', 'forward'):
-            method = getattr(task, method_name, None)
-            if method is not None:
-                try:
-                    return method(xs, conditions=conditions)
-                except TypeError:
-                    # Some signatures differ; try without keyword
-                    return method(xs, conditions)
-        raise RuntimeError(
-            f"Cannot find a generation method on {type(task).__name__}. "
-            f"Available methods: {[m for m in dir(task) if not m.startswith('_')]}"
-        )
-
-    kf_indices = list(range(0, T, step))
-    if kf_indices[-1] != T - 1:
-        kf_indices.append(T - 1)
-
-    print(f"   -> Phase 1: Generating {len(kf_indices)} anchor keyframes...")
-    video = call_task(prediction_task, video, cond)
-
-    if interpolation_task is not None:
-        print(f"   -> Phase 2: Interpolating gaps to fix color drift...")
-        for i in range(len(kf_indices) - 1):
-            start, end = kf_indices[i], kf_indices[i + 1]
-            if end - start <= 1:
-                continue
-            seg_indices = list(range(start, end + 1))
-            seg_xs = video[:, seg_indices]
-            seg_cond = cond[:, seg_indices]
-            interp_out = call_task(interpolation_task, seg_xs, seg_cond)
-            video[:, seg_indices] = interp_out
-    else:
-        print("   -> Phase 2: skipped (no interpolation task found in model)")
-
-    video = model._unnormalize_x(video)
-    video[0, 0] = image.to(device)
-    frames = (video[0].permute(0, 2, 3, 1) * 255).clamp(0, 255).byte().cpu()
+    frames = (xs_pred[0].permute(0, 2, 3, 1) * 255).clamp(0, 255).byte().cpu()
     return frames
 
 def _write_video(path, frames, fps):
