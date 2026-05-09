@@ -90,19 +90,6 @@ def parse_args():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_trajectory(txt_path: Path, n_frames: int) -> torch.Tensor:
-    """
-    Parse a RealEstate10K-format .txt file and return (n_frames, 16) camera poses.
-
-    The 16-dim output is:  [fx, fy, px, py, r11, r12, r13, tx,
-                                              r21, r22, r23, ty,
-                                              r31, r32, r33, tz]
-    (4 intrinsics + 12 extrinsics, matching dataset.external_cond_dim=16)
-
-    Accepted raw formats:
-      18 values/line – raw RE10K (values at positions 4-5 are silently dropped,
-                       mirroring _process_external_cond in realestate10k.py)
-      16 values/line – pre-processed (used as-is)
-    """
     cameras = []
     timestamps = []
 
@@ -119,10 +106,8 @@ def parse_trajectory(txt_path: Path, n_frames: int) -> torch.Tensor:
 
         parts = line.split()
 
-        # timestamp is first value
         timestamps.append(float(parts[0]))
 
-        # camera params (drop timestamp only)
         cam = np.array([float(x) for x in parts[1:]], dtype=np.float32)
         cameras.append(cam)
 
@@ -143,16 +128,18 @@ def parse_trajectory(txt_path: Path, n_frames: int) -> torch.Tensor:
     # target uniformly spaced time grid
     target_t = torch.linspace(0, 1, n_frames)
 
-    # interpolate in time space
+    cameras_np = cameras.numpy()
+    t_norm_np = t_norm.numpy()
+    target_t_np = target_t.numpy()
+
     cameras_out = []
     for dim in range(raw_dim):
-        cameras_out.append(
-            torch.interp(
-                target_t,
-                t_norm,
-                cameras[:, dim]
-            )
+        interp_dim = np.interp(
+            target_t_np,
+            t_norm_np,
+            cameras_np[:, dim]
         )
+        cameras_out.append(torch.from_numpy(interp_dim))
 
     cameras = torch.stack(cameras_out, dim=-1)
 
@@ -165,6 +152,7 @@ def parse_trajectory(txt_path: Path, n_frames: int) -> torch.Tensor:
         raise ValueError(
             f"{txt_path}: expected 18 or 16 values per line, got {raw_dim}."
         )
+
     return poses
 
 # ─────────────────────────────────────────────────────────────────────────────
