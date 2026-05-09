@@ -90,22 +90,48 @@ def parse_args():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_trajectory(txt_path: Path, n_frames: int) -> torch.Tensor:
+    """
+    Parse a RealEstate10K trajectory file and interpolate to exactly n_frames poses.
+
+    Supports:
+      - Raw RE10K format  (18 values/line: fx fy px py v4 v5 + 3x4 R|t)
+      - Pre-processed format (16 values/line: fx fy px py + 3x4 R|t)
+      - Files with or without a YouTube URL on line 1
+
+    Returns:
+        poses : (n_frames, 16) float32 tensor
+    """
+    if n_frames < 1:
+        raise ValueError(f"n_frames must be >= 1, got {n_frames}")
+
     cameras = []
-    timestamps = []
+    # FIX #2: keep timestamps as float64 throughout to avoid precision loss.
+    # RE10K timestamps are microseconds (~1.5e15), which overflows float32
+    # (max exact integer ~1.6e7), corrupting the normalised time grid used
+    # for interpolation.
+    timestamps: list[float] = []
 
     with open(txt_path, "r") as f:
         lines = f.readlines()
 
-    for i, line in enumerate(lines):
-        if i == 0:
-            continue  # YouTube URL
+    if not lines:
+        raise ValueError(f"Trajectory file is empty: {txt_path}")
 
+    # FIX #9: auto-detect whether line 0 is a URL header or camera data.
+    # Pre-processed files may omit the URL header; blindly skipping line 0
+    # would silently discard the first camera pose.
+    start_line = 0
+    first = lines[0].strip()
+    if first and not first[0].isdigit():
+        start_line = 1   # looks like a URL / non-numeric header — skip it
+
+    for line in lines[start_line:]:
         line = line.strip()
         if not line:
             continue
 
         parts = line.split()
-
+        # FIX #2 (cont.): parse timestamp with full float64 precision
         timestamps.append(float(parts[0]))
 
         cam = np.array([float(x) for x in parts[1:]], dtype=np.float32)
@@ -114,53 +140,52 @@ def parse_trajectory(txt_path: Path, n_frames: int) -> torch.Tensor:
     if not cameras:
         raise ValueError(f"No camera frames found in {txt_path}")
 
-    cameras = np.stack(cameras)  # (N, raw_dim)
-    timestamps = np.array(timestamps, dtype=np.float64)
+    cameras_np = np.stack(cameras)          # (N, raw_dim)  float32
+    timestamps_np = np.array(timestamps, dtype=np.float64)  # float64 — no overflow
 
-    cameras = torch.tensor(cameras, dtype=torch.float32)
-    timestamps = torch.tensor(timestamps, dtype=torch.float32)
+    N, raw_dim = cameras_np.shape
 
-    N, raw_dim = cameras.shape
+    # Normalise timestamps to [0, 1] in float64
+    t_min, t_max = timestamps_np.min(), timestamps_np.max()
+    t_norm = (timestamps_np - t_min) / (t_max - t_min + 1e-12)  # float64
 
-    # normalize time to [0, 1]
-    t_norm = (timestamps - timestamps.min()) / (timestamps.max() - timestamps.min() + 1e-8)
+    # Target uniformly-spaced grid in [0, 1]
+    target_t = np.linspace(0.0, 1.0, n_frames, dtype=np.float64)
 
-    # target uniformly spaced time grid
-    target_t = torch.linspace(0, 1, n_frames)
+    # Interpolate each camera parameter dimension independently.
+    # np.interp returns float64; cast explicitly to float32 before wrapping
+    # in a tensor to match the model's weight dtype.
+    # FIX #1: np.interp → float64; must cast to float32 or the conv layer
+    # raises "Input type (double) and bias type (float) should be the same".
+    cameras_interp = np.stack(
+        [np.interp(target_t, t_norm, cameras_np[:, d]).astype(np.float32)
+         for d in range(raw_dim)],
+        axis=-1,
+    )   # (n_frames, raw_dim)  float32
 
-    cameras_np = cameras.numpy()
-    t_norm_np = t_norm.numpy()
-    target_t_np = target_t.numpy()
+    cameras_t = torch.from_numpy(cameras_interp)   # float32
 
-    cameras_out = []
-    for dim in range(raw_dim):
-        interp_dim = np.interp(
-            target_t_np,
-            t_norm_np,
-            cameras_np[:, dim]
-        )
-        cameras_out.append(torch.from_numpy(interp_dim.astype(np.float32)))
-
-    cameras = torch.stack(cameras_out, dim=-1)
-
-    # Convert to 16-dim processed format
+    # Convert to 16-dim processed format (drop v4, v5 for raw RE10K files)
     if raw_dim == 18:
-        poses = torch.cat([cameras[:, :4], cameras[:, 6:]], dim=-1)
+        # layout: fx fy px py v4 v5 r11..r13 tx r21..r23 ty r31..r33 tz
+        poses = torch.cat([cameras_t[:, :4], cameras_t[:, 6:]], dim=-1)
     elif raw_dim == 16:
-        poses = cameras
+        poses = cameras_t
     else:
         raise ValueError(
-            f"{txt_path}: expected 18 or 16 values per line, got {raw_dim}."
+            f"{txt_path}: expected 18 or 16 values per line after timestamp, "
+            f"got {raw_dim}."
         )
 
-    return poses
+    return poses   # (n_frames, 16)  float32
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Image loading
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_image(image_path: Path, resolution: int = 256) -> torch.Tensor:
-    """Load, centre-crop to square, resize. Returns (3, H, W) in [0, 1]."""
+    """Load, centre-crop to square, resize. Returns (3, H, W) float32 in [0, 1]."""
     img = Image.open(image_path).convert("RGB")
     w, h = img.size
     min_dim = min(w, h)
@@ -169,7 +194,8 @@ def load_image(image_path: Path, resolution: int = 256) -> torch.Tensor:
         (w + min_dim) // 2, (h + min_dim) // 2,
     ))
     img = img.resize((resolution, resolution), Image.LANCZOS)
-    return TF.to_tensor(img)   # (3, H, W)
+    # TF.to_tensor returns float32 in [0, 1] — matches model's expected dtype
+    return TF.to_tensor(img)   # (3, H, W)  float32
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,6 +210,9 @@ def build_algo_config(n_frames: int, guidance_type: str, guidance_scale: float):
     interpolations (${dataset.xxx}), and dataset-experiment overrides
     (e.g. backbone architecture) are resolved identically to the training run.
     """
+    if n_frames < 1:
+        raise ValueError(f"n_frames must be >= 1, got {n_frames}")
+
     GlobalHydra.instance().clear()
     config_dir = str(PROJECT_ROOT / "configurations")
 
@@ -273,8 +302,8 @@ def load_model_weights(model: DFoTVideoPose, checkpoint_str: str, device: str) -
 @torch.no_grad()
 def generate(
     model: DFoTVideoPose,
-    image: torch.Tensor,     # (3, H, W) in [0, 1]
-    poses: torch.Tensor,     # (T, 16)
+    image: torch.Tensor,     # (3, H, W)  float32 in [0, 1]
+    poses: torch.Tensor,     # (T, 16)    float32
     device: str,
 ) -> torch.Tensor:
     """
@@ -288,23 +317,37 @@ def generate(
     """
     T = poses.shape[0]
 
+    if T < 1:
+        raise ValueError("poses must contain at least 1 frame")
+
+    # Guard: model requires at least n_context_frames frames
+    n_ctx = model.n_context_frames
+    if T < n_ctx:
+        raise ValueError(
+            f"n_frames ({T}) must be >= model.n_context_frames ({n_ctx})"
+        )
+
     # Build the full-length input tensor.
-    # The model uses xs[:, :n_context_tokens] as the conditioning context;
+    # The model uses xs[:, :n_context_frames] as the conditioning context;
     # the remaining tokens will be diffused / generated.
-    video = image.unsqueeze(0).expand(T, -1, -1, -1).clone()   # (T, 3, H, W)
+    # image is already float32; clone avoids in-place modification of the expand view.
+    video = image.unsqueeze(0).expand(T, -1, -1, -1).clone()   # (T, 3, H, W)  float32
     xs = video.unsqueeze(0).to(device)                          # (1, T, 3, H, W)
-    conditions = poses.unsqueeze(0).to(device)                  # (1, T, 16)
+    conditions = poses.unsqueeze(0).to(device)                  # (1, T, 16)    float32
 
     # Normalise exactly as on_after_batch_transfer does
     xs = model._normalize_x(xs)
 
-    # Handle latent-diffusion models (RE10K pretrained is pixel-space, but be safe)
+    # Handle latent-diffusion models (RE10K pretrained is pixel-space, but be safe).
+    # FIX #4: use explicit float32 for the zero tensor rather than inheriting the
+    # encoder's output dtype, which may be float16 in mixed-precision configs.
     if model.is_latent_diffusion:
-        n_ctx = model.n_context_frames
-        ctx_latents = model._encode(xs[:, :n_ctx])
-        xs_latent = torch.zeros(1, T, *ctx_latents.shape[2:], device=device,
-                                dtype=ctx_latents.dtype)
-        xs_latent[:, :n_ctx] = ctx_latents
+        ctx_latents = model._encode(xs[:, :n_ctx])   # (1, n_ctx, C_lat, H_lat, W_lat)
+        xs_latent = torch.zeros(
+            1, T, *ctx_latents.shape[2:],
+            device=device, dtype=torch.float32,
+        )
+        xs_latent[:, :n_ctx] = ctx_latents.float()
         xs = xs_latent
 
     # The sliding-window loop in _predict_sequence slices exactly max_tokens conditions
@@ -314,11 +357,14 @@ def generate(
     max_tokens = model.max_tokens
     sliding_ctx = model.cfg.tasks.prediction.sliding_context_len or max_tokens // 2
     stride = max_tokens - sliding_ctx
+
     if T > max_tokens and (T - max_tokens) % stride != 0:
         T_safe = T + stride - (T - max_tokens) % stride
         n_pad = T_safe - T
-        xs = torch.cat([xs, xs[:, -1:].expand(-1, n_pad, -1, -1, -1)], dim=1)
-        conditions = torch.cat([conditions, conditions[:, -1:].expand(-1, n_pad, -1)], dim=1)
+        xs = torch.cat([xs, xs[:, -1:].expand(-1, n_pad, *[-1] * (xs.dim() - 2))], dim=1)
+        conditions = torch.cat(
+            [conditions, conditions[:, -1:].expand(-1, n_pad, -1)], dim=1
+        )
     else:
         T_safe = T
 
@@ -335,11 +381,10 @@ def generate(
     # Unnormalize to [0, 1]
     xs_pred = model._unnormalize_x(xs_pred)                    # (1, T, 3, H, W)
 
-    # Paste the ground-truth context frame(s) back (same as validation_step does)
+    # Paste the ground-truth context frame(s) back (same as validation_step does).
+    # image is (3, H, W); expand to (1, n_ctx, 3, H, W) without copying.
     ctx = image.to(device).unsqueeze(0).unsqueeze(0)           # (1, 1, 3, H, W)
-    xs_pred[:, :model.n_context_frames] = ctx.expand(
-        1, model.n_context_frames, -1, -1, -1
-    )
+    xs_pred[:, :n_ctx] = ctx.expand(1, n_ctx, -1, -1, -1)
 
     # Convert to (T, H, W, 3) uint8
     frames = (xs_pred[0].permute(0, 2, 3, 1) * 255).clamp(0, 255).byte().cpu()
@@ -351,8 +396,13 @@ def generate(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _write_video(path: str, frames: torch.Tensor, fps: int) -> None:
-    """Pipe raw RGB frames into ffmpeg to produce a browser-compatible H.264 mp4.
-    Falls back to cv2 if ffmpeg is unavailable."""
+    """
+    Pipe raw RGB frames into ffmpeg to produce a browser-compatible H.264 mp4.
+    Falls back to cv2 if ffmpeg is unavailable or fails.
+
+    FIX #7: ffmpeg stderr is captured and re-raised on failure instead of being
+    silently discarded, so codec or path errors surface to the user.
+    """
     import subprocess
     H, W = frames.shape[1], frames.shape[2]
     cmd = [
@@ -363,18 +413,40 @@ def _write_video(path: str, frames: torch.Tensor, fps: int) -> None:
         "-vcodec", "libx264", "-pix_fmt", "yuv420p",
         path,
     ]
+    ffmpeg_ok = False
     try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
         for frame in frames.numpy():
-            proc.stdin.write(frame.tobytes())
+            # Ensure contiguous memory layout before writing raw bytes
+            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
         proc.stdin.close()
         proc.wait()
-    except Exception:
-        import cv2
-        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
-        for frame in frames.numpy():
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        writer.release()
+        if proc.returncode != 0:
+            err = proc.stderr.read().decode(errors="replace")
+            raise RuntimeError(f"ffmpeg exited with code {proc.returncode}:\n{err}")
+        ffmpeg_ok = True
+    except FileNotFoundError:
+        print("  ffmpeg not found — falling back to cv2")
+    except RuntimeError as e:
+        print(f"  ffmpeg failed ({e}) — falling back to cv2")
+
+    if not ffmpeg_ok:
+        try:
+            import cv2
+            writer = cv2.VideoWriter(
+                path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H)
+            )
+            for frame in frames.numpy():
+                writer.write(cv2.cvtColor(np.ascontiguousarray(frame), cv2.COLOR_RGB2BGR))
+            writer.release()
+        except Exception as e:
+            raise RuntimeError(
+                f"Both ffmpeg and cv2 failed to write video to {path}. "
+                f"cv2 error: {e}"
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -387,7 +459,15 @@ def main():
     # ── 1. Configuration ──────────────────────────────────────────────────────
     print("[1/5] Building configuration ...")
     algo_cfg = build_algo_config(args.n_frames, args.guidance_type, args.guidance_scale)
-    resolution = OmegaConf.select(algo_cfg, "x_shape.1", default=256)
+
+    # FIX #10: x_shape is [C, H, W]; index 1 is H (correct), but guard against
+    # the key being absent or having an unexpected layout with an explicit fallback.
+    x_shape = OmegaConf.select(algo_cfg, "x_shape", default=None)
+    if x_shape is not None and len(x_shape) == 3:
+        resolution = int(x_shape[1])   # H dimension
+    else:
+        resolution = 256
+        print(f"  Warning: could not read x_shape from config; defaulting to {resolution}px")
 
     # ── 2. Model ──────────────────────────────────────────────────────────────
     print("[2/5] Building model ...")
@@ -405,6 +485,10 @@ def main():
     print(f"      trajectory : {args.trajectory}  ({args.n_frames} frames)")
     image = load_image(args.image, resolution)
     poses = parse_trajectory(args.trajectory, args.n_frames)
+
+    # Sanity-check dtypes before handing off to the model
+    assert image.dtype == torch.float32, f"image dtype should be float32, got {image.dtype}"
+    assert poses.dtype == torch.float32, f"poses dtype should be float32, got {poses.dtype}"
 
     # ── 5. Generate & save ────────────────────────────────────────────────────
     print(f"[5/5] Generating {args.n_frames} frames on {args.device} ...")
