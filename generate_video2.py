@@ -112,48 +112,55 @@ def load_model_weights(model, checkpoint_str, device):
 def generate_hierarchical(model, image, poses, args):
     T = poses.shape[0]
     device = args.device
-    step = int(1 / args.keyframe_density) # e.g., 16
+    # Keyframe step (e.g., density 0.0625 = every 16 frames)
+    step = int(1 / args.keyframe_density)
 
-    # 1. Initialize Video (B, T, C, H, W)
-    video = torch.zeros((1, T, 3, 256, 256), device=device)
-    video[0, 0] = image.to(device)
-
-    # 2. Keyframe Indices (Anchor frames)
-    kf_indices = list(range(0, T, step))
-    if kf_indices[-1] != T - 1: kf_indices.append(T - 1)
-
-    # 3. Stage 1: Prediction (Generate Keyframes)
-    # We use a sparse mask so the model only focuses on predicting anchors
-    print(f"   -> Predicting {len(kf_indices)} keyframes...")
+    # 1. Initialize Video Buffer (B, T, C, H, W)
+    # We start with a tensor of the first frame expanded, but we will "anchor" it
+    video = image.unsqueeze(0).expand(T, -1, -1, -1).unsqueeze(0).to(device)
+    video = model._normalize_x(video)
     cond = poses.unsqueeze(0).to(device)
 
-    # We create a sparse sequence for the prediction task
-    sparse_xs = model._normalize_x(video.clone())
-    # Note: DFoT's internal _predict_videos handles masks if configured,
-    # but for most stability, we predict keyframes sequentially or via sparse attention.
-    # Here we simulate the repo's 'validation' logic:
-    sparse_out = model._predict_videos(sparse_xs, conditions=cond, task_name="prediction")
+    # 2. Define Keyframe Indices
+    kf_indices = list(range(0, T, step))
+    if kf_indices[-1] != T - 1:
+        kf_indices.append(T - 1)
 
-    # Extract predicted keyframes into our video buffer
-    for idx in kf_indices:
-        video[:, idx] = model._unnormalize_x(sparse_out)[:, idx]
-    video[0, 0] = image.to(device) # Keep original frame 0
+    print(f"   -> Phase 1: Generating {len(kf_indices)} anchor keyframes...")
+    # Use the Prediction Task directly to avoid the TypeError
+    # This task uses the guidance_scale=4.0 and stabilization defined in your config
+    prediction_task = model.tasks['prediction']
 
-    # 4. Stage 2: Interpolation (Filling the gaps)
-    print(f"   -> Interpolating {T - len(kf_indices)} gap frames...")
+    # Generate the sequence of keyframes
+    # We predict the whole sequence, then treat the specific indices as "truth" for phase 2
+    video = prediction_task.predict_video(video, conditions=cond)
+
+    print(f"   -> Phase 2: Interpolating gaps to fix color drift...")
+    # The Interpolation Task uses the lower guidance (1.5) to keep things smooth
+    interpolation_task = model.tasks['interpolation']
+
+    # We iterate through the gaps and fill them
     for i in range(len(kf_indices) - 1):
         start, end = kf_indices[i], kf_indices[i+1]
-        if end - start <= 1: continue
+        if end - start <= 1:
+            continue
 
-        # Segment for interpolation
+        # Select the segment (including the two anchors)
         seg_indices = list(range(start, end + 1))
-        seg_xs = model._normalize_x(video[:, seg_indices])
+        # Interpolation needs the start and end frames as "known" context
+        # We pass the segment to the task
+        seg_xs = video[:, seg_indices]
         seg_cond = cond[:, seg_indices]
 
-        # Run interpolation task for this segment
-        # In DFoT, interpolation uses the start/end as context automatically
-        interp_out = model._predict_videos(seg_xs, conditions=seg_cond, task_name="interpolation")
-        video[:, seg_indices] = model._unnormalize_x(interp_out)
+        # Fill the gap
+        interp_out = interpolation_task.predict_video(seg_xs, conditions=seg_cond)
+        video[:, seg_indices] = interp_out
+
+    # 3. Finalize and Unnormalize
+    video = model._unnormalize_x(video)
+
+    # Ensure the very first frame is exactly the input image (pixel perfect)
+    video[0, 0] = image.to(device)
 
     frames = (video[0].permute(0, 2, 3, 1) * 255).clamp(0, 255).byte().cpu()
     return frames
