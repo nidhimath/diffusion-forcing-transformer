@@ -79,10 +79,16 @@ def build_algo_config(args):
     GlobalHydra.instance().clear()
     with initialize_config_dir(config_dir=str(PROJECT_ROOT / "configurations"), version_base=None):
         cfg = compose(config_name="config", overrides=[
-            "dataset=realestate10k", "algorithm=dfot_video_pose", "experiment=video_generation",
-            "++algorithm.diffusion.is_continuous=true", "++algorithm.backbone.use_fourier_noise_embedding=true",
-            "++algorithm.backbone.channels=[128,256,576,1152]", "++algorithm.backbone.num_updown_blocks=[3,3,6]",
-            "++algorithm.backbone.num_mid_blocks=20", "++algorithm.backbone.num_heads=9",
+            "dataset=realestate10k",
+            "algorithm=dfot_video_pose",
+            "experiment=video_generation",
+            "++algorithm.diffusion.is_continuous=true",
+            "++algorithm.backbone.use_fourier_noise_embedding=true",
+            "++algorithm.diffusion.precond_scale=0.125",
+            "++algorithm.backbone.channels=[128,256,576,1152]",
+            "++algorithm.backbone.num_updown_blocks=[3,3,6]",
+            "++algorithm.backbone.num_mid_blocks=20",
+            "++algorithm.backbone.num_heads=9",
             f"dataset.n_frames={args.n_frames}", "dataset.context_length=1",
             f"++algorithm.tasks.prediction.history_guidance.name={args.guidance_type}",
             f"++algorithm.tasks.prediction.history_guidance.guidance_scale={args.guidance_scale}",
