@@ -112,56 +112,71 @@ def load_model_weights(model, checkpoint_str, device):
 def generate_hierarchical(model, image, poses, args):
     T = poses.shape[0]
     device = args.device
-    # Keyframe step (e.g., density 0.0625 = every 16 frames)
     step = int(1 / args.keyframe_density)
 
-    # 1. Initialize Video Buffer (B, T, C, H, W)
-    # We start with a tensor of the first frame expanded, but we will "anchor" it
     video = image.unsqueeze(0).expand(T, -1, -1, -1).unsqueeze(0).to(device)
     video = model._normalize_x(video)
     cond = poses.unsqueeze(0).to(device)
 
-    # 2. Define Keyframe Indices
+    # Find tasks by their class name instead of string-indexing.
+    prediction_task = None
+    interpolation_task = None
+    for task in model.tasks:
+        cls = type(task).__name__.lower()
+        if 'prediction' in cls:
+            prediction_task = task
+        elif 'interpolation' in cls:
+            interpolation_task = task
+
+    if prediction_task is None:
+        raise RuntimeError(
+            "Could not find a prediction task in model.tasks. "
+            f"Available task types: {[type(t).__name__ for t in model.tasks]}"
+        )
+
+    # ── FIX: the task method is likely `sample` or `generate`, not
+    # `predict_video`. Inspect what's actually available at runtime.
+    # The official pipeline calls the task via the experiment runner, which
+    # invokes task.generate() or task.sample() with a data batch dict.
+    # Use getattr with a fallback so you get a clear error if wrong.
+    def call_task(task, xs, conditions):
+        """Try the known method names in order."""
+        for method_name in ('generate', 'sample', 'predict_video', 'forward'):
+            method = getattr(task, method_name, None)
+            if method is not None:
+                try:
+                    return method(xs, conditions=conditions)
+                except TypeError:
+                    # Some signatures differ; try without keyword
+                    return method(xs, conditions)
+        raise RuntimeError(
+            f"Cannot find a generation method on {type(task).__name__}. "
+            f"Available methods: {[m for m in dir(task) if not m.startswith('_')]}"
+        )
+
     kf_indices = list(range(0, T, step))
     if kf_indices[-1] != T - 1:
         kf_indices.append(T - 1)
 
     print(f"   -> Phase 1: Generating {len(kf_indices)} anchor keyframes...")
-    # Use the Prediction Task directly to avoid the TypeError
-    # This task uses the guidance_scale=4.0 and stabilization defined in your config
-    prediction_task = model.tasks['prediction']
+    video = call_task(prediction_task, video, cond)
 
-    # Generate the sequence of keyframes
-    # We predict the whole sequence, then treat the specific indices as "truth" for phase 2
-    video = prediction_task.predict_video(video, conditions=cond)
+    if interpolation_task is not None:
+        print(f"   -> Phase 2: Interpolating gaps to fix color drift...")
+        for i in range(len(kf_indices) - 1):
+            start, end = kf_indices[i], kf_indices[i + 1]
+            if end - start <= 1:
+                continue
+            seg_indices = list(range(start, end + 1))
+            seg_xs = video[:, seg_indices]
+            seg_cond = cond[:, seg_indices]
+            interp_out = call_task(interpolation_task, seg_xs, seg_cond)
+            video[:, seg_indices] = interp_out
+    else:
+        print("   -> Phase 2: skipped (no interpolation task found in model)")
 
-    print(f"   -> Phase 2: Interpolating gaps to fix color drift...")
-    # The Interpolation Task uses the lower guidance (1.5) to keep things smooth
-    interpolation_task = model.tasks['interpolation']
-
-    # We iterate through the gaps and fill them
-    for i in range(len(kf_indices) - 1):
-        start, end = kf_indices[i], kf_indices[i+1]
-        if end - start <= 1:
-            continue
-
-        # Select the segment (including the two anchors)
-        seg_indices = list(range(start, end + 1))
-        # Interpolation needs the start and end frames as "known" context
-        # We pass the segment to the task
-        seg_xs = video[:, seg_indices]
-        seg_cond = cond[:, seg_indices]
-
-        # Fill the gap
-        interp_out = interpolation_task.predict_video(seg_xs, conditions=seg_cond)
-        video[:, seg_indices] = interp_out
-
-    # 3. Finalize and Unnormalize
     video = model._unnormalize_x(video)
-
-    # Ensure the very first frame is exactly the input image (pixel perfect)
     video[0, 0] = image.to(device)
-
     frames = (video[0].permute(0, 2, 3, 1) * 255).clamp(0, 255).byte().cpu()
     return frames
 
